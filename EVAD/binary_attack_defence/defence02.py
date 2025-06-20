@@ -1,0 +1,228 @@
+#!/usr/bin/env python
+# coding: utf-8
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
+import magic
+import numpy as np
+from secml.array import CArray
+from secml_malware.models.malconv import MalConv, DNN_Net
+from secml_malware.models.c_classifier_end2end_malware import CClassifierEnd2EndMalware, End2EndModel
+from secml_malware.attack.whitebox.c_headerPlus_evasion import CHeaderPlusEvasion
+import matplotlib.pyplot as plt
+
+# Define target model
+net_choice = 'MalConv'  # MalConv/AvastNet
+
+if net_choice == 'MalConv':
+    net = MalConv()
+    net = CClassifierEnd2EndMalware(net)
+    net.load_pretrained_model()
+    net.load_pretrained_model('./secml_malware/data/trained/pretrained_malconv.pth')
+    partial_dos = CHeaderPlusEvasion(net, random_init=False, iterations=10,
+                                      header_and_padding=True, threshold=0.5,
+                                      how_many=144, is_debug=False)
+else:
+    net = DNN_Net()
+    net = CClassifierEnd2EndMalware(net)
+    net.load_pretrained_model('./secml_malware/data/trained/dnn_pe.pth')
+    partial_dos = CHeaderPlusEvasion(net, random_init=False, iterations=10,
+                                      header_and_padding=False, threshold=0.5,
+                                      how_many=0, is_debug=False)
+
+# Load dataset
+Train_folder = "/home/subash/Desktop/phase2/Dataset/Virus/Virus train/Zeroaccess"
+Test_folder = "/home/subash/Desktop/phase2/Dataset/Virus/Virus test/Zeroaccess"
+
+Train_X, Train_y, train_file_names = [], [], []
+Test_X, Test_y, test_file_names = [], [], []
+
+# Load Train samples
+for f in os.listdir(Train_folder):
+    path = os.path.join(Train_folder, f)
+    if "PE32" not in magic.from_file(path):
+        continue
+    with open(path, "rb") as file_handle:
+        code = file_handle.read()
+    x = End2EndModel.bytes_to_numpy(code, net.get_input_max_length(), 256, False)
+    _, confidence = net.predict(CArray(x), True)
+    if confidence[0, 1].item() < 0.5:
+        continue
+    print(f"> Added Train: {f} with confidence {confidence[0,1].item()}")
+    Train_X.append(x)
+    conf = confidence[1][0].item()
+    Train_y.append([1 - conf, conf])
+    train_file_names.append(path)
+
+# Load Test samples
+for f in os.listdir(Test_folder):
+    path = os.path.join(Test_folder, f)
+    if "PE32" not in magic.from_file(path):
+        continue
+    with open(path, "rb") as file_handle:
+        code = file_handle.read()
+    x = End2EndModel.bytes_to_numpy(code, net.get_input_max_length(), 256, False)
+    _, confidence = net.predict(CArray(x), True)
+    if confidence[0, 1].item() < 0.5:
+        continue
+    print(f"> Added Test: {f} with confidence {confidence[0,1].item()}")
+    Test_X.append(x)
+    conf = confidence[1][0].item()
+    Test_y.append([1 - conf, conf])
+    test_file_names.append(path)
+
+# === Compute Clean Test Accuracy Before Adversarial Attacks ===
+clean_correct = 0
+for sample, label in zip(Test_X, Test_y):
+    _, confidence = net.predict(CArray(sample), True)
+    if confidence[0, 1].item() >= 0.5:
+        clean_correct += 1
+clean_test_accuracy = clean_correct / len(Test_y) * 100
+print(f"\n✅ Clean Test Accuracy (before attack): {clean_test_accuracy:.2f}%")
+
+# Simple defense: clipping bytes to [0, 255]
+def defense_function(x):
+    return np.clip(x, 0, 255)
+
+# Metrics for visualization
+evasion_rates_train, evasion_rates_test, defense_accuracies = [], [], []
+best_success_rate = 0
+
+# Evasion + Defense loop
+for epoch in range(5):
+    success = 0
+    for sample, label in zip(Train_X, Train_y):
+        y_pred, adv_score, adv_ds, f_obj, byte_change = partial_dos.run(CArray(sample), CArray(label[1]))
+        if f_obj < 0.5:
+            success += 1
+        adv_x = adv_ds.X[0, :]
+        real_adv_x = partial_dos.create_real_sample_from_adv(train_file_names[0], adv_x)
+
+    avg_success = success / len(train_file_names)
+    evasion_rates_train.append(avg_success * 100)
+    print(f"Epoch:{epoch} Train evasion rate (patch gen): {avg_success:.3%}")
+
+    # Apply patch to train set and check evasion
+    train_success, defense_correct = 0, 0
+    for sample, label in zip(Train_X, Train_y):
+        indexes_to_perturb = list(range(2, 0x3C))
+        padding_positions = CArray(sample).find(CArray(sample) == 256)
+        if padding_positions:
+            indexes_to_perturb += list(range(padding_positions[0], min(len(sample), padding_positions[0] + 144)))
+        for b in range(len(indexes_to_perturb)):
+            sample[indexes_to_perturb[b]] = byte_change[b]
+        defended_sample = defense_function(sample)
+        _, confidence = net.predict(CArray(defended_sample), True)
+        if confidence[0, 1].item() < 0.5:
+            train_success += 1
+        else:
+            defense_correct += 1
+    avg_train_success = train_success / len(train_file_names)
+    print(f"Epoch:{epoch} Train evasion rate: {avg_train_success:.3%}")
+
+    # Apply patch to test set and evaluate
+    test_success, defense_correct_test = 0, 0
+    for sample, label in zip(Test_X, Test_y):
+        indexes_to_perturb = list(range(2, 0x3C))
+        padding_positions = CArray(sample).find(CArray(sample) == 256)
+        if padding_positions:
+            indexes_to_perturb += list(range(padding_positions[0], min(len(sample), padding_positions[0] + 144)))
+        for b in range(len(indexes_to_perturb)):
+            sample[indexes_to_perturb[b]] = byte_change[b]
+        defended_sample = defense_function(sample)
+        _, confidence = net.predict(CArray(defended_sample), True)
+        if confidence[0, 1].item() < 0.5:
+            test_success += 1
+        else:
+            defense_correct_test += 1
+    avg_test_success = test_success / len(test_file_names)
+    evasion_rates_test.append(avg_test_success * 100)
+    defense_acc = defense_correct_test / len(test_file_names)
+    defense_accuracies.append(defense_acc * 100)
+
+    print(f"Epoch:{epoch} Test evasion rate: {avg_test_success:.3%}")
+    print(f"Epoch:{epoch} Defense accuracy rate: {defense_acc:.3%}")
+
+    if avg_test_success > best_success_rate:
+        best_success_rate = avg_test_success
+
+print("\n📊 Best evasion rate on testset: {:.3f}%".format(100 * best_success_rate))
+
+# ===== Plot Results =====
+epochs = list(range(1, 6))
+plt.figure(figsize=(10, 6))
+plt.plot(epochs, evasion_rates_train, label="Train Evasion Rate", marker='o')
+plt.plot(epochs, evasion_rates_test, label="Test Evasion Rate", marker='o')
+plt.plot(epochs, defense_accuracies, label="Defense Accuracy Rate", marker='x')
+plt.xlabel("Epoch")
+plt.ylabel("Rate (%)")
+plt.title("Evasion Rate and Defense Accuracy over Epochs")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === Additional Metrics and Plots ===
+best_defense_acc = max(defense_accuracies)
+best_epoch_defense = defense_accuracies.index(best_defense_acc) + 1
+best_test_evasion_rate = max(evasion_rates_test)
+best_epoch_test_evasion = evasion_rates_test.index(best_test_evasion_rate) + 1
+
+# Compare clean test accuracy to defense accuracy
+if clean_test_accuracy > best_defense_acc:
+    print("\n✅ Condition satisfied: Clean Test Accuracy is greater than Defense Accuracy.")
+else:
+    print("\n❌ Condition NOT satisfied: Defense Accuracy is greater than Clean Test Accuracy.")
+
+# Highlighted plot for defense accuracy
+plt.figure(figsize=(10, 6))
+plt.plot(epochs, defense_accuracies, label="Defense Accuracy", marker='o', color='green')
+plt.axhline(best_defense_acc, color='red', linestyle='--',
+            label=f"Best Defense Acc: {best_defense_acc:.2f}% (Epoch {best_epoch_defense})")
+plt.xlabel("Epoch")
+plt.ylabel("Defense Accuracy (%)")
+plt.title("Defense Accuracy with Best Epoch Highlighted")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Test Evasion vs Defense Accuracy
+plt.figure(figsize=(10, 6))
+plt.plot(epochs, evasion_rates_test, label="Test Evasion Rate", marker='s', color='blue')
+plt.plot(epochs, defense_accuracies, label="Defense Accuracy", marker='^', color='orange')
+plt.xlabel("Epoch")
+plt.ylabel("Rate (%)")
+plt.title("Test Evasion vs Defense Accuracy")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Scatter plot for trade-off
+plt.figure(figsize=(8, 6))
+plt.scatter(evasion_rates_test, defense_accuracies, color='purple')
+for i, (x, y) in enumerate(zip(evasion_rates_test, defense_accuracies)):
+    plt.text(x + 0.5, y + 0.5, f'E{i+1}')
+plt.xlabel("Evasion Rate on Test Set (%)")
+plt.ylabel("Defense Accuracy (%)")
+plt.title("Tradeoff Scatter: Evasion vs Defense Success")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Bar chart comparing clean test accuracy and defense accuracy
+plt.figure(figsize=(8, 6))
+plt.bar(['Clean Test Accuracy', 'Best Defense Accuracy'],
+        [clean_test_accuracy, best_defense_acc],
+        color=['skyblue', 'salmon'])
+plt.title("Clean Test Accuracy vs Best Defense Accuracy")
+plt.ylabel("Accuracy (%)")
+plt.ylim(0, 100)
+plt.grid(axis='y')
+plt.tight_layout()
+plt.show()
+
+print(f"\n✅ Best Defense Accuracy: {best_defense_acc:.2f}% at Epoch {best_epoch_defense}")
+print(f"📈 Best Test Evasion Rate: {best_test_evasion_rate:.2f}% at Epoch {best_epoch_test_evasion}")
+print(f"🧪 Clean Test Accuracy (before attack): {clean_test_accuracy:.2f}%")
